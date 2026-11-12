@@ -1,0 +1,158 @@
+name: Candle CPU public scatter gradient proof
+on:
+  push:
+    branches: [codex/diagnose-scatter-destination-gradients]
+permissions:
+  contents: read
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      HF_HUB_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: huggingface/candle
+          ref: cfcbd7186d13271843ce7eb41d25659bd0835850
+          persist-credentials: false
+      - name: Pin CPU Rust toolchain and unchanged full source
+        run: |
+          test "$(git rev-parse HEAD)" = cfcbd7186d13271843ce7eb41d25659bd0835850
+          test -z "$(git status --porcelain)"
+          rustup toolchain install 1.99.1 --profile minimal
+          rustc +1.99.1 --version
+          cargo +1.99.1 --version
+      - name: Existing native forward and gradient controls
+        run: |
+          cargo +1.99.1 test -p candle-core --test tensor_tests scatter_cpu -- --nocapture
+          cargo +1.99.1 test -p candle-core --test grad_tests
+      - name: Public finite CPU forward, analytic and finite-difference probe
+        run: |
+          test ! -e candle-core/tests/numeric41_probe.rs
+          cat > candle-core/tests/numeric41_probe.rs <<'CANDLE_PROBE'
+          use candle_core::{Device, Result, Tensor, Var};
+
+          fn output(init: &[f64], src: &[f64], add: bool) -> Result<Tensor> {
+              let dev = Device::Cpu;
+              let init = Tensor::new(init, &dev)?;
+              let src = Tensor::new(src, &dev)?;
+              let ids = Tensor::new(&[2u32, 0, 1], &dev)?;
+              if add { init.scatter_add(&ids, &src, 0) } else { init.scatter(&ids, &src, 0) }
+          }
+
+          fn loss(init: &[f64], src: &[f64], add: bool) -> Result<f64> {
+              let weights = Tensor::new(&[1f64, 2., 4.], &Device::Cpu)?;
+              output(init, src, add)?.mul(&weights)?.sum_all()?.to_scalar()
+          }
+
+          fn finite_difference(init: &[f64; 3], src: &[f64; 3], add: bool, perturb_init: bool) -> Result<Vec<f64>> {
+              let h = 1e-4;
+              let mut result = Vec::new();
+              for coordinate in 0..3 {
+                  let (mut plus_init, mut minus_init) = (*init, *init);
+                  let (mut plus_src, mut minus_src) = (*src, *src);
+                  if perturb_init {
+                      plus_init[coordinate] += h;
+                      minus_init[coordinate] -= h;
+                  } else {
+                      plus_src[coordinate] += h;
+                      minus_src[coordinate] -= h;
+                  }
+                  result.push((loss(&plus_init, &plus_src, add)? - loss(&minus_init, &minus_src, add)?) / (2. * h));
+              }
+              Ok(result)
+          }
+
+          #[test]
+          fn scatter_destination_gradients() -> Result<()> {
+              let dev = Device::Cpu;
+              let init_values = [10f64, 20., 30.];
+              let src_values = [2f64, 3., 5.];
+              let ids = Tensor::new(&[2u32, 0, 1], &dev)?;
+              let weights = Tensor::new(&[1f64, 2., 4.], &dev)?;
+              // Establish real public forward semantics before inspecting the gradients.
+              let overwrite = output(&init_values, &src_values, false)?.to_vec1::<f64>()?;
+              let accumulate = output(&init_values, &src_values, true)?.to_vec1::<f64>()?;
+              println!("scatter forward={overwrite:?}; scatter_add forward={accumulate:?}");
+              assert_eq!(overwrite, [3., 5., 2.]);
+              assert_eq!(accumulate, [13., 25., 32.]);
+              let mut destination_results = Vec::new();
+              for add in [false, true] {
+                  let init = Var::new(&init_values, &dev)?;
+                  let src = Var::new(&src_values, &dev)?;
+                  let out = if add { init.scatter_add(&ids, &src, 0)? } else { init.scatter(&ids, &src, 0)? };
+                  let grads = out.mul(&weights)?.sum_all()?.backward()?;
+                  let init_grad = grads.get(&init).expect("init gradient").to_vec1::<f64>()?;
+                  let src_grad = grads.get(&src).expect("source gradient").to_vec1::<f64>()?;
+                  let fd_init = finite_difference(&init_values, &src_values, add, true)?;
+                  let fd_src = finite_difference(&init_values, &src_values, add, false)?;
+                  let expected_init = if add { vec![1., 2., 4.] } else { vec![0., 0., 0.] };
+                  println!("add={add}: init_grad={init_grad:?}; src_grad={src_grad:?}; fd_init={fd_init:?}; fd_src={fd_src:?}");
+                  for (actual, expected) in fd_init.iter().zip(expected_init.iter()) { assert!((actual - expected).abs() < 1e-7); }
+                  for (actual, expected) in fd_src.iter().zip([4., 1., 2.].iter()) { assert!((actual - expected).abs() < 1e-7); }
+                  assert_eq!(src_grad, [4., 1., 2.]);
+                  destination_results.push((init_grad, expected_init));
+              }
+              // Check both paths only after printing their forward and derivative evidence.
+              for (actual, expected) in destination_results { assert_eq!(actual, expected); }
+              Ok(())
+          }
+
+          #[test]
+          fn scatter_partial_update_gradients() -> Result<()> {
+              let dev = Device::Cpu;
+              let ids = Tensor::new(&[1u32], &dev)?;
+              let weights = Tensor::new(&[1f64, 2., 4.], &dev)?;
+              let mut all_correct = true;
+              for add in [false, true] {
+                  let init = Var::new(&[10f64, 20., 30.], &dev)?;
+                  let src = Var::new(&[5f64], &dev)?;
+                  let out = if add { init.scatter_add(&ids, &src, 0)? } else { init.scatter(&ids, &src, 0)? };
+                  let actual_forward = out.to_vec1::<f64>()?;
+                  let expected_forward = if add { vec![10., 25., 30.] } else { vec![10., 5., 30.] };
+                  println!("partial add={add}: forward={actual_forward:?}");
+                  assert_eq!(actual_forward, expected_forward);
+                  match out.mul(&weights)?.sum_all()?.backward() {
+                      Ok(grads) => {
+                          let init_grad = grads.get(&init).expect("init gradient").to_vec1::<f64>()?;
+                          let src_grad = grads.get(&src).expect("src gradient").to_vec1::<f64>()?;
+                          let expected_init = if add { vec![1., 2., 4.] } else { vec![1., 0., 4.] };
+                          println!("partial add={add}: init_grad={init_grad:?}; src_grad={src_grad:?}; expected_init={expected_init:?}");
+                          all_correct &= init_grad == expected_init && src_grad == vec![2.];
+                      }
+                      Err(error) => { println!("partial add={add}: backward_error={error:?}"); all_correct = false; }
+                  }
+              }
+              assert!(all_correct, "valid partial updates must differentiate with the source/index shape");
+              Ok(())
+          }
+          CANDLE_PROBE
+          set +e
+          cargo +1.99.1 test -p candle-core --test numeric41_probe -- --nocapture 2>&1 | tee "$RUNNER_TEMP/candle-probe.log"
+          product_status=${PIPESTATUS[0]}
+          set -e
+          test "$product_status" -eq 101
+          python3 - <<'CANDLE_RESULT'
+          import json,os,pathlib,subprocess
+          text=pathlib.Path(os.environ['RUNNER_TEMP'],'candle-probe.log').read_text()
+          assert 'test result: FAILED. 0 passed; 2 failed;' in text,text
+          assert 'scatter forward=[3.0, 5.0, 2.0]; scatter_add forward=[13.0, 25.0, 32.0]' in text,text
+          assert 'add=false: init_grad=[1.0, 2.0, 4.0]' in text,text
+          assert 'add=true: init_grad=[0.0, 0.0, 0.0]' in text,text
+          assert 'partial add=true: backward_error=' in text,text
+          assert subprocess.check_output(['git','diff','--name-only'],text=True)==''
+          print('CANDLE_CPU_PUBLIC_BEFORE='+json.dumps({'source':'cfcbd7186d13271843ce7eb41d25659bd0835850','public_forward_controls':True,'independent_finite_differences_passed':True,'wrong_destination_gradients_both_ops':True,'partial_accumulation_backward_error':True,'tracked_source_unchanged':True}))
+          CANDLE_RESULT
+      - name: Record resolved dependency lock for exact after replay
+        if: always()
+        run: |
+          test -z "$(git diff --name-only)"
+          if test -f Cargo.lock; then
+            sha256sum Cargo.lock
+            echo CANDLE_CARGO_LOCK_BEGIN
+            cat Cargo.lock
+            echo CANDLE_CARGO_LOCK_END
+          fi
